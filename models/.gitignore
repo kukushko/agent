@@ -1,0 +1,4 @@
+# Model weights are large local artifacts. Keep this directory out of git except docs.
+*
+!.gitignore
+!README.md
