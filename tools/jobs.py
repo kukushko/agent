@@ -8,6 +8,7 @@ from .base import (
     Availability,
     Delegation,
     ToolEnvironment,
+    ToolExposure,
     ToolPackage,
     tool,
     with_tool_success,
@@ -17,13 +18,15 @@ from .base import (
 JOB_PROMPT_INSTRUCTIONS = (
     "Python jobs:",
     "- Use the job tool when loops, conditions, filtering, aggregation, or many tool calls should execute without returning every intermediate value to the model context.",
+    "- Design one end-to-end job for the user's task before calling it. Put predictable discovery, selection, fetching, managed-file reading, parsing, calculation, and semantic interpretation steps in the same program; return only the compact final evidence or answer in result.",
+    "- Do not use repeated jobs as wrappers around one delegated call each. Run another job only when the previous job genuinely failed or returned evidence that could not have been anticipated when writing it.",
     "- Pass a concise Python program in its code argument without Markdown fences.",
     "- Every delegated tool call must begin with the literal tools. prefix: catalog name package.method becomes tools.package.method(...). Never call package.method(...) without tools.",
     "- The tools proxy is already available. Importing tools is supported but unnecessary; do not install or implement a tools module.",
     "- A tool with exactly one required parameter accepts that value positionally; otherwise use keyword arguments.",
     "- Tool results support both value.key and value['key']; arrays are ordinary Python lists.",
     "- Failed calls raise ToolError. Always assign the final JSON-compatible value to the global variable result; printing it is not a substitute.",
-    "- Never use Python open() for a file named or requested by the user. It accesses only private files created by the current job; use a delegated file tool for managed work files.",
+    "- Never use Python open(), pathlib, subprocess, shell commands, os.walk(), or similar local filesystem APIs to find or read files named or requested by the user. They see only the job's private directory, not managed work files; use delegated file tools instead.",
     "- After a successful job result, answer the user from that result. Do not run another job unless the result reports a failure or lacks required data.",
 )
 
@@ -78,6 +81,11 @@ class JobTools(ToolPackage):
         return Availability(False, service.unavailable_reason or "job sandbox is unavailable")
 
     @tool(
+        exposure=ToolExposure(
+            direct=True,
+            delegated=False,
+            orchestration_entrypoint=True,
+        ),
         delegation=Delegation(
             allowed=False,
             costs={},

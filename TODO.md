@@ -2,10 +2,8 @@
 
 ## Job-Centric Tool Mode
 
-- Explore an optional mode where the main model sees only `jobs.run`, while a
-  job can use delegated `tools.*` capabilities through MCP.
-- Evaluate direct, job-centric, and hybrid modes with repeatable e2e benchmarks
-  before changing the default tool exposure model.
+- Evaluate hybrid and jobs modes with repeatable e2e benchmarks before changing
+  the default tool exposure model.
 
 ## Semantic Retrieval Follow-ups
 

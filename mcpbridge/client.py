@@ -338,7 +338,10 @@ class HttpMcpClient(JsonRpcMcpClient):
 class McpToolCollection:
     """Aggregate tools from embedded and external MCP servers."""
 
-    def __init__(self) -> None:
+    def __init__(self, direct_mode: str = "hybrid") -> None:
+        if direct_mode not in ("hybrid", "jobs"):
+            raise ValueError(f"unknown direct tool mode: {direct_mode}")
+        self.direct_mode = direct_mode
         self._connections: list[McpConnection] = []
         self._tools: dict[str, tuple[McpConnection, McpTool]] = {}
         self._delegated_tools: dict[str, tuple[McpConnection, McpTool]] = {}
@@ -378,10 +381,10 @@ class McpToolCollection:
 
     @property
     def tool_count(self) -> int:
-        return len(self._tools)
+        return len(self._active_tools())
 
     def execute(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
-        entry = self._tools.get(name)
+        entry = self._active_tools().get(name)
         if entry is None:
             return McpToolResult(False, name, {"error": f"unknown tool: {name}"})
         connection, tool = entry
@@ -401,7 +404,7 @@ class McpToolCollection:
                     "parameters": tool.input_schema,
                 },
             }
-            for name, (_, tool) in sorted(self._tools.items())
+            for name, (_, tool) in sorted(self._active_tools().items())
         ]
 
     def tool_descriptors(self) -> tuple[McpTool, ...]:
@@ -412,6 +415,7 @@ class McpToolCollection:
         )
 
     def prompt_instructions(self) -> str:
+        active_tools = self._active_tools()
         lines = [
             "Tools are available through MCP servers.",
             "Use a tool only when it is needed to satisfy the user's request.",
@@ -424,7 +428,17 @@ class McpToolCollection:
             "",
             "Available tools:",
         ]
-        for name, (_, tool) in sorted(self._tools.items()):
+        if self.direct_mode == "jobs":
+            lines.extend(
+                (
+                    "The direct catalog is in jobs mode: use an orchestration entrypoint "
+                    "for tasks that need tools, and call delegated tools from its program.",
+                    "Before calling an entrypoint, construct one end-to-end program that "
+                    "performs all predictable tool steps and returns a compact final result. "
+                    "Do not use separate entrypoint calls merely to inspect each intermediate result.",
+                )
+            )
+        for name, (_, tool) in sorted(active_tools.items()):
             properties = tool.input_schema.get("properties", {})
             required = set(tool.input_schema.get("required", []))
             rendered = [
@@ -442,7 +456,13 @@ class McpToolCollection:
                 )
             )
         prompt_instructions: list[str] = []
-        for _, tool in sorted(self._tools.values(), key=lambda item: item[1].name):
+        instruction_tools = {
+            **active_tools,
+            **self._delegated_tools,
+        }
+        for _, tool in sorted(
+            instruction_tools.values(), key=lambda item: item[1].name
+        ):
             metadata = tool.metadata or {}
             raw_instructions = metadata.get("prompt_instructions", [])
             if not isinstance(raw_instructions, list):
@@ -468,7 +488,7 @@ class McpToolCollection:
     def tools_by_epistemic_role(self) -> dict[str, list[str]]:
         """Group exposed tools by portable reliability role metadata."""
         tools_by_role: dict[str, list[str]] = {}
-        for name, (_, tool) in sorted(self._tools.items()):
+        for name, (_, tool) in sorted(self._active_tools().items()):
             metadata = tool.metadata or {}
             raw_roles = metadata.get("epistemic_roles", [])
             if not isinstance(raw_roles, list):
@@ -491,7 +511,7 @@ class McpToolCollection:
     def reliability_guidance(self) -> set[str]:
         """Collect opaque reliability guidance owned by exposed tools."""
         guidance: set[str] = set()
-        for _, tool in self._tools.values():
+        for _, tool in self._active_tools().values():
             metadata = tool.metadata or {}
             raw_guidance = metadata.get("reliability_guidance", [])
             if isinstance(raw_guidance, list):
@@ -524,6 +544,15 @@ class McpToolCollection:
         self._connections.clear()
         self._tools.clear()
         self._delegated_tools.clear()
+
+    def _active_tools(self) -> dict[str, tuple[McpConnection, McpTool]]:
+        if self.direct_mode == "hybrid":
+            return self._tools
+        return {
+            name: value
+            for name, value in self._tools.items()
+            if tool_is_orchestration_entrypoint(value[1])
+        }
 
 
 def parse_tool_descriptors(raw_tools: list[Any], server_name: str) -> list[McpTool]:
@@ -572,6 +601,16 @@ def tool_is_delegable(tool: McpTool) -> bool:
     metadata = tool.metadata or {}
     delegation = metadata.get("delegation", {})
     return not isinstance(delegation, dict) or delegation.get("allowed", True) is True
+
+
+def tool_is_orchestration_entrypoint(tool: McpTool) -> bool:
+    """Read portable direct-mode metadata with conservative external defaults."""
+    metadata = tool.metadata or {}
+    exposure = metadata.get("exposure", {})
+    return (
+        isinstance(exposure, dict)
+        and exposure.get("orchestration_entrypoint", False) is True
+    )
 
 
 def reliability_instructions(

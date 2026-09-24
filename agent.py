@@ -535,6 +535,12 @@ def parse_args() -> argparse.Namespace:
         help="do not start the bundled MCP tool server",
     )
     parser.add_argument(
+        "--tool-mode",
+        choices=("hybrid", "jobs"),
+        default=os.environ.get("AGENT_TOOL_MODE", "hybrid"),
+        help="direct tool catalog mode, default: hybrid",
+    )
+    parser.add_argument(
         "--add-mcp",
         action="append",
         default=[],
@@ -1400,6 +1406,7 @@ def main() -> int:
         model=args.model,
         work_dir=str(args.work_dir.resolve()),
         embedded_mcp=not args.disable_embedded_mcp,
+        tool_mode=args.tool_mode,
         external_mcp=[name for name, _ in args.mcp_servers],
     )
     renderer = PromptRenderer(args.system_prompt)
@@ -1442,7 +1449,7 @@ def main() -> int:
 
 def create_mcp_tools(args: argparse.Namespace) -> McpToolCollection:
     """Connect embedded and configured external MCP tool servers."""
-    collection = McpToolCollection()
+    collection = McpToolCollection(direct_mode=args.tool_mode)
     try:
         if not args.disable_embedded_mcp:
             command = [

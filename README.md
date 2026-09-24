@@ -42,6 +42,7 @@ Defaults:
 - work file tools root: `./work`
 - max sequential tool calls per turn: 4
 - bundled MCP server: enabled as a managed stdio child process
+- direct tool mode: `hybrid`
 
 Agent-wide settings can be overridden with command-line arguments or their
 `AGENT_*` environment variables:
@@ -60,6 +61,7 @@ Agent-wide settings can be overridden with command-line arguments or their
 | work directory | `--work-dir` | `AGENT_WORK_DIR` |
 | tool-call limit | `--max-tool-calls` | `AGENT_MAX_TOOL_CALLS` |
 | history limit | `--history-limit` | `AGENT_HISTORY_LIMIT` |
+| direct tool mode | `--tool-mode hybrid\|jobs` | `AGENT_TOOL_MODE` |
 
 The agent's model endpoint and the MCP delegated-model endpoint are contacted
 directly. Generic process-wide HTTP proxy variables do not reroute these model
@@ -128,6 +130,20 @@ The child inherits the terminal process group, exits normally when its MCP stdin
 reaches EOF, and is explicitly terminated by the agent if it does not stop in
 time. Consequently Ctrl+C and normal agent shutdown do not leave the embedded
 server running.
+
+The agent supports two direct-catalog modes:
+
+- `hybrid` is the default and exposes every tool whose portable metadata permits
+  direct use, including `jobs.run`.
+- `jobs` exposes only direct tools marked as orchestration entrypoints. In the
+  bundled catalog this is currently only `jobs.run`; its generated Python still
+  sees the complete delegated `tools.*` catalog.
+
+Select the mode with `--tool-mode jobs` or `AGENT_TOOL_MODE=jobs`. Filtering is
+performed from generic exposure metadata, not package or method names. External
+MCP tools remain hidden from the main model in jobs mode unless their metadata
+explicitly marks them as orchestration entrypoints; they remain available to
+jobs through the embedded server's delegated dependency connection.
 
 The model may use either OpenAI-compatible structured calls or the retained
 text-call form:
@@ -297,7 +313,8 @@ TOOL_PACKAGES = (ExampleTools,)
 The runtime registers this method as `example.search`, validates its signature,
 and generates its prompt schema from the type hints, defaults, and docstring.
 The decorator also owns portable metadata such as whether direct and delegated
-surfaces expose the tool, its named resource costs, optional prompt instructions, and
+surfaces expose the tool, whether it is an orchestration entrypoint, its named
+resource costs, optional prompt instructions, and
 epistemic roles and role-specific reliability guidance. Roles describe generic ways a tool can improve reliability,
 such as `lookup`, `verification`, `computation`, `workspace`, or
 `orchestration`. The MCP client uses the active catalog to generate a soft
@@ -419,6 +436,10 @@ command line.
 The container has no network, sees only its own persistent job directory, and
 cannot directly access the agent work directory. Tool calls cross the sandbox
 through an atomic filesystem request/response broker handled by the MCP server.
+In jobs tool mode, the prompt includes package-owned guidance from the complete
+delegated catalog, not only from the directly visible orchestration entrypoint.
+This lets packages document their result fields and safe multi-tool workflows
+without teaching the MCP bridge concrete tool names or domain semantics.
 
 Job code uses a generated synchronous proxy:
 
@@ -444,9 +465,11 @@ result = {"written": "answer.txt"}
 Tool response objects support both attribute and item access. Failed calls raise
 `ToolError`, which job code may catch. The program must assign its final
 JSON-compatible value to the global `result` variable. Built-in `open()` reads
-and writes private job artifacts; files in `work/` must be accessed through
-`tools.files.*`. A missing `open()` target reports this boundary explicitly
-rather than implying that the corresponding work file does not exist.
+and writes private job artifacts. Other local filesystem mechanisms such as
+`pathlib`, `os.walk()`, subprocesses, and shell commands have the same private
+view; files in `work/` must be accessed through `tools.files.*`. A missing local
+target reports this boundary explicitly rather than implying that the
+corresponding work file does not exist.
 
 The `tools` proxy is injected automatically and is also importable, so both
 direct `tools.files.read(...)` usage and generated `import tools.files` code are

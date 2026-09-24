@@ -40,6 +40,7 @@ class ToolExposure:
 
     direct: bool = True
     delegated: bool = True
+    orchestration_entrypoint: bool = False
 
 
 @dataclass(frozen=True)

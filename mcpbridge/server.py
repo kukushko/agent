@@ -213,6 +213,9 @@ def tool_descriptor(definition: Any) -> dict[str, Any]:
                 "exposure": {
                     "direct": definition.metadata.exposure.direct,
                     "delegated": definition.metadata.exposure.delegated,
+                    "orchestration_entrypoint": (
+                        definition.metadata.exposure.orchestration_entrypoint
+                    ),
                 },
                 "prompt_instructions": list(definition.metadata.prompt_instructions),
                 "epistemic_roles": list(definition.metadata.epistemic_roles),

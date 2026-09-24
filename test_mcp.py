@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agent import ChatMessage, parse_mcp_servers
 from mcpbridge import HttpMcpClient, McpToolCollection, StdioMcpClient
-from mcpbridge.client import JsonRpcMcpClient
+from mcpbridge.client import JsonRpcMcpClient, McpTool, McpToolResult
 from mcpbridge.protocol import McpError
 
 
@@ -32,7 +32,57 @@ class ScriptedMcpClient(JsonRpcMcpClient):
         return None
 
 
+class StaticMcpConnection:
+    name = "synthetic"
+    trusted_context = False
+    delegated_tools = ()
+
+    def __init__(self):
+        ordinary_metadata = {
+            "exposure": {"direct": True, "delegated": True}
+        }
+        entrypoint_metadata = {
+            "exposure": {
+                "direct": True,
+                "delegated": False,
+                "orchestration_entrypoint": True,
+            }
+        }
+        self.tools = (
+            McpTool("alpha", "Ordinary tool.", {"type": "object"}, ordinary_metadata),
+            McpTool("launch", "Entry point.", {"type": "object"}, entrypoint_metadata),
+        )
+
+    def initialize(self):
+        return self.tools
+
+    def call_tool(self, name, arguments, context):
+        return McpToolResult(True, name, {"called": name})
+
+    def close(self):
+        return None
+
+
 class McpProtocolTest(unittest.TestCase):
+    def test_jobs_mode_filters_by_generic_entrypoint_metadata(self) -> None:
+        hybrid = McpToolCollection(direct_mode="hybrid")
+        hybrid.add(StaticMcpConnection(), prefix=False)
+        self.assertEqual(
+            [item["function"]["name"] for item in hybrid.api_definitions()],
+            ["alpha", "launch"],
+        )
+
+        jobs = McpToolCollection(direct_mode="jobs")
+        jobs.add(StaticMcpConnection(), prefix=False)
+        self.assertEqual(
+            [item["function"]["name"] for item in jobs.api_definitions()],
+            ["launch"],
+        )
+        self.assertFalse(jobs.execute("alpha", {}).ok)
+        self.assertTrue(jobs.execute("launch", {}).ok)
+        self.assertIn("direct catalog is in jobs mode", jobs.prompt_instructions())
+        self.assertIn("one end-to-end program", jobs.prompt_instructions())
+
     def test_external_server_specs_are_named_and_unique(self) -> None:
         self.assertEqual(
             parse_mcp_servers(["docs=http://localhost:9000/mcp"]),
@@ -176,6 +226,12 @@ class McpTransportIntegrationTest(unittest.TestCase):
                     )
                     self.assertIn(
                         "tools.llm.ask(", collection.prompt_instructions()
+                    )
+                    self.assertIn(
+                        "markdown_path", collection.prompt_instructions()
+                    )
+                    self.assertIn(
+                        "Make web jobs resilient", collection.prompt_instructions()
                     )
                     self.assertIn(
                         ".content.splitlines()", collection.prompt_instructions()
