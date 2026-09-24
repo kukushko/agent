@@ -855,7 +855,7 @@ class ChatCompletionFlowTest(unittest.TestCase):
         self.assertEqual(
             payloads[1]["chat_template_kwargs"], {"enable_thinking": False}
         )
-        self.assertEqual(payloads[1]["max_tokens"], 16_384)
+        self.assertEqual(payloads[1]["max_tokens"], 32_768)
         self.assertIn("Do not deliberate", payloads[1]["messages"][0]["content"])
 
     def test_sends_history_as_chat_messages_and_returns_usage(self) -> None:

@@ -33,12 +33,12 @@ python3.12 agent.py --system custom_prompt.txt
 Defaults:
 
 - API base URL: `http://192.168.0.108:8000/v1`
-- model: `/root/models/Qwen3-30B-A3B-Thinking-2507-FP4`
+- model: `/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
 - system prompt: `SYSTEM_PROMPT.txt`
 - context window: approximately 131k tokens
 - history limit: 24 prior messages
 - Qwen thinking mode: enabled
-- output token limit: 8192
+- output token limit: 16384
 - work file tools root: `./work`
 - max sequential tool calls per turn: 4
 - bundled MCP server: enabled as a managed stdio child process
@@ -238,7 +238,7 @@ into the same internal tool-call protocol before execution.
 
 The prompt budget assumes a 131072-token context window. If a completion reaches
 `finish_reason: length` before producing text or a tool call, the client retries
-that API request once with at least 16384 output tokens, a concise-response
+that API request once with at least 32768 output tokens, a concise-response
 instruction, and `enable_thinking=false` as a best-effort provider hint. Models
 are not assumed to support disabling thinking. Usage from both attempts is
 included in the turn total.
