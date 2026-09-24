@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from debuglog import DebugLog, default_debug_log
 from mcpbridge import HttpMcpClient, McpError, McpToolCollection, StdioMcpClient
@@ -49,6 +49,12 @@ ANSI_USER = "\x1b[97m"
 ANSI_AGENT = "\x1b[90m"
 ANSI_ACTIVITY = "\x1b[38;5;25m"
 PENDING_STDIN_BYTES = bytearray()
+DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
+
+
+def urlopen(request: Request, timeout: float):
+    """Open a model request directly while retaining a test seam."""
+    return DIRECT_URL_OPENER.open(request, timeout=timeout)
 
 
 @dataclass
@@ -1389,7 +1395,7 @@ def main() -> int:
     debug_log = default_debug_log()
     debug_log.record(
         "agent.start",
-        argv=sys.argv,
+        argv=redact_cli_secrets(sys.argv),
         base_url=args.base_url,
         model=args.model,
         work_dir=str(args.work_dir.resolve()),
@@ -1452,7 +1458,17 @@ def create_mcp_tools(args: argparse.Namespace) -> McpToolCollection:
             for value in args.add_mcp:
                 command.extend(("--add-mcp", value))
             collection.add(
-                StdioMcpClient("embedded", command, trusted_context=True),
+                StdioMcpClient(
+                    "embedded",
+                    command,
+                    trusted_context=True,
+                    environment={
+                        "MCP_LLM_BASE_URL": args.base_url,
+                        "MCP_LLM_MODEL": args.model,
+                        "MCP_LLM_API_KEY": args.api_key,
+                        "MCP_LLM_TIMEOUT": str(args.timeout),
+                    },
+                ),
                 prefix=False,
             )
         elif args.tool_param:
@@ -1478,6 +1494,24 @@ def create_mcp_tools(args: argparse.Namespace) -> McpToolCollection:
         ],
     )
     return collection
+
+
+def redact_cli_secrets(argv: list[str]) -> list[str]:
+    """Redact known secret-bearing command-line values before debug logging."""
+    redacted: list[str] = []
+    hide_next = False
+    for value in argv:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+        elif value == "--api-key":
+            redacted.append(value)
+            hide_next = True
+        elif value.startswith("--api-key="):
+            redacted.append("--api-key=<redacted>")
+        else:
+            redacted.append(value)
+    return redacted
 
 
 def read_user_input(prompt: str, input_history: list[str]) -> ReadResult:

@@ -15,6 +15,7 @@ ToolMethod = TypeVar("ToolMethod", bound=Callable[..., Any])
 _TOOL_MARKER = "__agent_tool__"
 _TOOL_METADATA = "__agent_tool_metadata__"
 TOOL_SUCCESS_MARKER = "__agent_tool_success__"
+TOOL_RESOURCE_USAGE_MARKER = "__agent_tool_resource_usage__"
 _CURRENT_CONTEXT: ContextVar[ToolContext | None] = ContextVar(
     "tool_context", default=None
 )
@@ -34,10 +35,19 @@ class Delegation:
 
 
 @dataclass(frozen=True)
+class ToolExposure:
+    """Declare which generic execution surfaces may expose a tool."""
+
+    direct: bool = True
+    delegated: bool = True
+
+
+@dataclass(frozen=True)
 class ToolMetadata:
     """Portable behavior and prompt metadata owned by a tool declaration."""
 
     delegation: Delegation = field(default_factory=Delegation)
+    exposure: ToolExposure = field(default_factory=ToolExposure)
     prompt_instructions: tuple[str, ...] = ()
     epistemic_roles: tuple[str, ...] = ()
     reliability_guidance: tuple[str, ...] = ()
@@ -47,6 +57,7 @@ def tool(
     method: ToolMethod | None = None,
     *,
     delegation: Delegation = Delegation(),
+    exposure: ToolExposure = ToolExposure(),
     prompt_instructions: tuple[str, ...] = (),
     epistemic_roles: tuple[str, ...] = (),
     reliability_guidance: tuple[str, ...] = (),
@@ -59,6 +70,7 @@ def tool(
             _TOOL_METADATA,
             ToolMetadata(
                 delegation,
+                exposure,
                 tuple(prompt_instructions),
                 tuple(epistemic_roles),
                 tuple(reliability_guidance),
@@ -84,6 +96,13 @@ def with_tool_success(
 ) -> dict[str, object]:
     """Attach internal success metadata consumed by the tool registry."""
     return {TOOL_SUCCESS_MARKER: success, **result}
+
+
+def with_tool_resource_usage(
+    result: dict[str, object], usage: Mapping[str, int]
+) -> dict[str, object]:
+    """Attach generic measured resource usage consumed by orchestration."""
+    return {TOOL_RESOURCE_USAGE_MARKER: dict(usage), **result}
 
 
 @dataclass(frozen=True)

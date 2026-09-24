@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from jobruntime import JobService
+from llmservice import OpenAIJsonService
 from mcpbridge import HttpMcpClient, McpToolCollection
 from mcpbridge.protocol import decode_message, encode_message, error_payload
 from mcpbridge.server import McpServer
@@ -19,6 +21,7 @@ from sandbox import DockerSandbox
 from toolconfig import parse_mcp_servers, parse_tool_parameters
 from tools import ServiceRegistry, ToolEnvironment, discover_tool_packages
 from tools.jobs import JobRunner
+from tools.llm import LanguageModelService
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -26,6 +29,8 @@ DEFAULT_SANDBOX_IMAGE = "terminal-agent-python312-sandbox:local"
 DEFAULT_SANDBOX_CONTEXT = SCRIPT_DIR / "sandbox" / "python312"
 DEFAULT_JOBS_DIR = SCRIPT_DIR / "tmp" / "jobs"
 MAX_HTTP_REQUEST_BYTES = 4_194_304
+DEFAULT_LLM_BASE_URL = "http://192.168.0.108:8000/v1"
+DEFAULT_LLM_MODEL = "/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +69,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_JOBS_DIR,
         help="persistent job state directory, default: ./tmp/jobs beside this script",
     )
+    parser.add_argument(
+        "--llm-base-url",
+        default=os.environ.get("MCP_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+        help="OpenAI-compatible endpoint used by delegated LLM tools",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=os.environ.get("MCP_LLM_MODEL", DEFAULT_LLM_MODEL),
+        help="model used by delegated LLM tools",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=float(os.environ.get("MCP_LLM_TIMEOUT", "120")),
+        help="delegated LLM request timeout in seconds",
+    )
     args = parser.parse_args()
     try:
         args.tool_parameters = parse_tool_parameters(args.tool_param)
@@ -71,6 +92,8 @@ def parse_args() -> argparse.Namespace:
         args.listen_address = parse_listen_address(args.listen)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.llm_timeout <= 0:
+        parser.error("--llm-timeout must be positive")
     return args
 
 
@@ -96,6 +119,15 @@ def create_server(args: argparse.Namespace) -> McpServer:
     job_service = JobService(args.jobs_dir, sandbox)
     services = ServiceRegistry()
     services.register(JobRunner, job_service)
+    services.register(
+        LanguageModelService,
+        OpenAIJsonService(
+            base_url=args.llm_base_url,
+            model=args.llm_model,
+            api_key=os.environ.get("MCP_LLM_API_KEY", "local"),
+            timeout=args.llm_timeout,
+        ),
+    )
     environment = ToolEnvironment(
         work_dir=args.work_dir,
         sandbox=sandbox,

@@ -99,40 +99,16 @@ class McpServer:
     def _list_tools(self) -> dict[str, Any]:
         return {
             "tools": [
-                {
-                    "name": definition.name,
-                    "description": definition.description,
-                    "inputSchema": {
-                        **definition.parameters,
-                        "additionalProperties": False,
-                    },
-                    "_meta": {
-                        "terminal-agent/tool": {
-                            "delegation": {
-                                "allowed": definition.metadata.delegation.allowed,
-                                "costs": dict(definition.metadata.delegation.costs),
-                                "quota_defaults": dict(
-                                    definition.metadata.delegation.quota_defaults
-                                ),
-                                "instructions": list(
-                                    definition.metadata.delegation.instructions
-                                ),
-                                "reason": definition.metadata.delegation.reason,
-                            },
-                            "prompt_instructions": list(
-                                definition.metadata.prompt_instructions
-                            ),
-                            "epistemic_roles": list(
-                                definition.metadata.epistemic_roles
-                            ),
-                            "reliability_guidance": list(
-                                definition.metadata.reliability_guidance
-                            ),
-                        }
-                    },
-                }
-                for definition in self.registry.definitions()
-            ]
+                tool_descriptor(definition)
+                for definition in self.registry.definitions("direct")
+            ],
+            "_meta": {
+                "terminal-agent/delegatedTools": [
+                    tool_descriptor(definition)
+                    for definition in self.registry.definitions("delegated")
+                    if not definition.metadata.exposure.direct
+                ]
+            },
         }
 
     def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -142,6 +118,8 @@ class McpServer:
             raise ValueError("tool name must be a string")
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
+        if not self.registry.is_exposed(name, "direct"):
+            raise ValueError(f"tool is not available for direct calls: {name}")
         context = context_from_meta(params.get("_meta"))
         if context is None:
             result = self.registry.execute(name, arguments)
@@ -152,6 +130,7 @@ class McpServer:
             "ok": result.ok,
             "name": result.name,
             "result": result.result,
+            "resource_usage": result.resource_usage,
         }
         return {
             "content": [
@@ -196,10 +175,12 @@ def is_modern_request(params: dict[str, Any]) -> bool:
 def modern_result(
     result: dict[str, Any], cacheable: bool = False
 ) -> dict[str, Any]:
+    existing_meta = result.get("_meta", {})
     modern = {
         **result,
         "resultType": "complete",
         "_meta": {
+            **(existing_meta if isinstance(existing_meta, dict) else {}),
             "io.modelcontextprotocol/serverInfo": {
                 "name": "terminal-agent-tools",
                 "version": "1.0",
@@ -209,3 +190,33 @@ def modern_result(
     if cacheable:
         modern.update({"ttlMs": 0, "cacheScope": "private"})
     return modern
+
+
+def tool_descriptor(definition: Any) -> dict[str, Any]:
+    """Serialize one tool declaration for direct or delegated discovery."""
+    return {
+        "name": definition.name,
+        "description": definition.description,
+        "inputSchema": {
+            **definition.parameters,
+            "additionalProperties": False,
+        },
+        "_meta": {
+            "terminal-agent/tool": {
+                "delegation": {
+                    "allowed": definition.metadata.delegation.allowed,
+                    "costs": dict(definition.metadata.delegation.costs),
+                    "quota_defaults": dict(definition.metadata.delegation.quota_defaults),
+                    "instructions": list(definition.metadata.delegation.instructions),
+                    "reason": definition.metadata.delegation.reason,
+                },
+                "exposure": {
+                    "direct": definition.metadata.exposure.direct,
+                    "delegated": definition.metadata.exposure.delegated,
+                },
+                "prompt_instructions": list(definition.metadata.prompt_instructions),
+                "epistemic_roles": list(definition.metadata.epistemic_roles),
+                "reliability_guidance": list(definition.metadata.reliability_guidance),
+            }
+        },
+    }

@@ -11,6 +11,7 @@ from jobruntime.service import (
     require_safe_directory,
 )
 from tools import Delegation
+from tools.runtime import ToolResult
 from tools.jobs import normalize_generated_code
 
 
@@ -74,6 +75,19 @@ class JobPolicyTest(unittest.TestCase):
         self.assertEqual(usage.as_dict(), {"records": 1, "tool_calls": 2})
         with self.assertRaisesRegex(RuntimeError, "tool_calls"):
             service._charge("beta.transform", usage)
+
+    def test_measured_resource_usage_is_charged_generically(self) -> None:
+        service = JobService(
+            Path("unused"),
+            UnusedSandbox(),
+            JobPolicy(quotas={"model_tokens": 10}),
+        )
+        usage = JobUsage()
+        service._charge_usage({"model_tokens": 7}, usage)
+        self.assertEqual(usage.as_dict(), {"model_tokens": 7})
+        with self.assertRaisesRegex(RuntimeError, "model_tokens"):
+            service._charge_usage({"model_tokens": 4}, usage)
+        self.assertEqual(usage.as_dict(), {"model_tokens": 11})
 
     def test_broker_rejects_symlinked_ipc_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

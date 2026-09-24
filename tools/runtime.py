@@ -10,13 +10,14 @@ import pkgutil
 import re
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Union, get_args, get_origin, get_type_hints
 
 from toolpolicy import render_reliability_turn_guidance
 
 from .base import (
     TOOL_SUCCESS_MARKER,
+    TOOL_RESOURCE_USAGE_MARKER,
     ToolContext,
     ToolEnvironment,
     ToolMetadata,
@@ -51,6 +52,7 @@ class ToolResult:
     ok: bool
     name: str
     result: dict[str, Any]
+    resource_usage: dict[str, int] = field(default_factory=dict)
 
 
 class ToolRegistry:
@@ -88,11 +90,30 @@ class ToolRegistry:
                 raise TypeError("tool result must be a dictionary")
             normalized = dict(value)
             success = normalized.pop(TOOL_SUCCESS_MARKER, True)
+            resource_usage = normalized.pop(TOOL_RESOURCE_USAGE_MARKER, {})
             if not isinstance(success, bool):
                 raise TypeError("internal tool success marker must be a boolean")
-            return ToolResult(success, name, normalized)
+            if not isinstance(resource_usage, dict) or any(
+                not isinstance(resource, str)
+                or not NAME_RE.fullmatch(resource)
+                or not isinstance(amount, int)
+                or isinstance(amount, bool)
+                or amount < 0
+                for resource, amount in resource_usage.items()
+            ):
+                raise TypeError("internal tool resource usage must contain non-negative integers")
+            return ToolResult(success, name, normalized, dict(resource_usage))
         except (OSError, RuntimeError, UnicodeError, TypeError, ValueError) as exc:
             return ToolResult(False, name, {"error": str(exc)})
+
+    def is_exposed(self, name: str, surface: str) -> bool:
+        """Return whether a registered tool is visible on an execution surface."""
+        definition = self._tools.get(name)
+        if definition is None:
+            return False
+        if surface not in ("direct", "delegated"):
+            raise ValueError(f"unknown tool exposure surface: {surface}")
+        return bool(getattr(definition.metadata.exposure, surface))
 
     def prompt_instructions(self) -> str:
         lines = [
@@ -107,7 +128,7 @@ class ToolRegistry:
             "",
             "Available tools:",
         ]
-        for definition in self.definitions():
+        for definition in self.definitions("direct"):
             schema = definition.parameters
             properties = schema["properties"]
             required = set(schema["required"])
@@ -120,7 +141,7 @@ class ToolRegistry:
         prompt_instructions = list(
             dict.fromkeys(
                 instruction
-                for definition in self.definitions()
+                for definition in self.definitions("direct")
                 for instruction in definition.metadata.prompt_instructions
             )
         )
@@ -132,12 +153,12 @@ class ToolRegistry:
         """Build the same generic reliability reminder used by MCP clients."""
         roles = {
             role
-            for definition in self.definitions()
+            for definition in self.definitions("direct")
             for role in definition.metadata.epistemic_roles
         }
         guidance = {
             value
-            for definition in self.definitions()
+            for definition in self.definitions("direct")
             for value in definition.metadata.reliability_guidance
         }
         return render_reliability_turn_guidance(roles, guidance)
@@ -145,13 +166,23 @@ class ToolRegistry:
     def reliability_catalog(self) -> dict[str, list[str]]:
         """Return role-to-tool mappings for reliability assessment."""
         catalog: dict[str, list[str]] = {}
-        for definition in self.definitions():
+        for definition in self.definitions("direct"):
             for role in definition.metadata.epistemic_roles:
                 catalog.setdefault(role, []).append(definition.name)
         return catalog
 
-    def definitions(self) -> tuple[ToolDefinition, ...]:
-        return tuple(self._tools[name] for name in sorted(self._tools))
+    def definitions(self, surface: str | None = None) -> tuple[ToolDefinition, ...]:
+        """Return tools visible on a generic execution surface."""
+        if surface not in (None, "direct", "delegated"):
+            raise ValueError(f"unknown tool exposure surface: {surface}")
+        definitions = tuple(self._tools[name] for name in sorted(self._tools))
+        if surface is None:
+            return definitions
+        return tuple(
+            definition
+            for definition in definitions
+            if getattr(definition.metadata.exposure, surface)
+        )
 
     def api_definitions(self) -> list[dict[str, Any]]:
         """Return OpenAI-compatible function definitions for the active tools."""
@@ -167,7 +198,7 @@ class ToolRegistry:
                     },
                 },
             }
-            for definition in self.definitions()
+            for definition in self.definitions("direct")
         ]
 
     @contextmanager

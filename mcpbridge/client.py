@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -42,6 +43,7 @@ class McpToolResult:
     ok: bool
     name: str
     result: dict[str, Any]
+    resource_usage: dict[str, int] = field(default_factory=dict)
 
 
 class McpConnection(Protocol):
@@ -66,6 +68,7 @@ class JsonRpcMcpClient:
         self._next_id = 1
         self._lock = threading.Lock()
         self.protocol_version = PROTOCOL_VERSION
+        self.delegated_tools: tuple[McpTool, ...] = ()
 
     def initialize(self) -> tuple[McpTool, ...]:
         try:
@@ -89,6 +92,7 @@ class JsonRpcMcpClient:
                 raise McpError(f"MCP server {self.name!r} returned invalid initialization data")
             self._notify("notifications/initialized", {})
         tools: list[McpTool] = []
+        delegated_tools: list[McpTool] = []
         cursor: str | None = None
         while True:
             listed = self._request(
@@ -114,12 +118,21 @@ class JsonRpcMcpClient:
                 if not isinstance(metadata, dict):
                     metadata = {}
                 tools.append(McpTool(name, description, schema, metadata))
+            raw_list_meta = listed.get("_meta", {})
+            raw_delegated = (
+                raw_list_meta.get("terminal-agent/delegatedTools", [])
+                if isinstance(raw_list_meta, dict)
+                else []
+            )
+            if isinstance(raw_delegated, list):
+                delegated_tools.extend(parse_tool_descriptors(raw_delegated, self.name))
             next_cursor = listed.get("nextCursor")
             if next_cursor is None:
                 break
             if not isinstance(next_cursor, str) or not next_cursor:
                 raise McpError(f"MCP server {self.name!r} returned an invalid tools cursor")
             cursor = next_cursor
+        self.delegated_tools = tuple(delegated_tools)
         return tuple(tools)
 
     def call_tool(
@@ -134,12 +147,18 @@ class JsonRpcMcpClient:
             envelope_ok = structured.get("ok")
             envelope_result = structured.get("result")
             returned_name = structured.get("name", name)
+            resource_usage = structured.get("resource_usage", {})
             if (
                 isinstance(envelope_ok, bool)
                 and isinstance(envelope_result, dict)
                 and isinstance(returned_name, str)
             ):
-                return McpToolResult(envelope_ok, returned_name, envelope_result)
+                return McpToolResult(
+                    envelope_ok,
+                    returned_name,
+                    envelope_result,
+                    resource_usage if isinstance(resource_usage, dict) else {},
+                )
             return McpToolResult(not bool(response.get("isError")), name, structured)
         return McpToolResult(
             not bool(response.get("isError")), name, normalize_content_result(response)
@@ -191,7 +210,13 @@ class JsonRpcMcpClient:
 class StdioMcpClient(JsonRpcMcpClient):
     """MCP client connected to a managed child process over stdio."""
 
-    def __init__(self, name: str, command: list[str], trusted_context: bool = False) -> None:
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        trusted_context: bool = False,
+        environment: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(name, trusted_context)
         self.process = subprocess.Popen(
             command,
@@ -200,6 +225,7 @@ class StdioMcpClient(JsonRpcMcpClient):
             stderr=subprocess.PIPE,
             bufsize=0,
             close_fds=True,
+            env={**os.environ, **environment} if environment is not None else None,
         )
         self._stderr_thread = threading.Thread(target=self._forward_stderr, daemon=True)
         self._stderr_thread.start()
@@ -315,6 +341,7 @@ class McpToolCollection:
     def __init__(self) -> None:
         self._connections: list[McpConnection] = []
         self._tools: dict[str, tuple[McpConnection, McpTool]] = {}
+        self._delegated_tools: dict[str, tuple[McpConnection, McpTool]] = {}
         self._context: dict[str, Any] | None = None
 
     def add(self, connection: McpConnection, prefix: bool) -> None:
@@ -326,12 +353,24 @@ class McpToolCollection:
         pending: dict[str, tuple[McpConnection, McpTool]] = {}
         for tool in tools:
             exposed_name = f"{connection.name}.{tool.name}" if prefix else tool.name
-            if exposed_name in self._tools or exposed_name in pending:
+            if (
+                exposed_name in self._tools
+                or exposed_name in self._delegated_tools
+                or exposed_name in pending
+            ):
                 connection.close()
                 raise McpError(f"duplicate MCP tool name: {exposed_name}")
             pending[exposed_name] = (connection, tool)
+        pending_delegated = dict(pending)
+        for tool in getattr(connection, "delegated_tools", ()):
+            exposed_name = f"{connection.name}.{tool.name}" if prefix else tool.name
+            if exposed_name in pending_delegated or exposed_name in self._delegated_tools:
+                connection.close()
+                raise McpError(f"duplicate delegated MCP tool name: {exposed_name}")
+            pending_delegated[exposed_name] = (connection, tool)
         self._connections.append(connection)
         self._tools.update(pending)
+        self._delegated_tools.update(pending_delegated)
 
     @property
     def server_count(self) -> int:
@@ -348,7 +387,7 @@ class McpToolCollection:
         connection, tool = entry
         try:
             result = connection.call_tool(tool.name, arguments, self._context)
-            return McpToolResult(result.ok, name, result.result)
+            return McpToolResult(result.ok, name, result.result, result.resource_usage)
         except (McpError, OSError, RuntimeError, TypeError, ValueError) as exc:
             return McpToolResult(False, name, {"error": str(exc)})
 
@@ -369,7 +408,7 @@ class McpToolCollection:
         """Return exposed names and schemas for internal routing or job catalogs."""
         return tuple(
             McpTool(name, tool.description, tool.input_schema, tool.metadata)
-            for name, (_, tool) in sorted(self._tools.items())
+            for name, (_, tool) in sorted(self._delegated_tools.items())
         )
 
     def prompt_instructions(self) -> str:
@@ -415,13 +454,13 @@ class McpToolCollection:
             lines.extend(("", *prompt_instructions))
             delegated = [
                 name
-                for name, (_, tool) in sorted(self._tools.items())
+                for name, (_, tool) in sorted(self._delegated_tools.items())
                 if tool_is_delegable(tool)
             ]
             if delegated:
                 lines.extend(("", "Tools available to delegated execution:"))
                 lines.extend(
-                    f"- {delegated_signature(name, self._tools[name][1])}"
+                    f"- {delegated_signature(name, self._delegated_tools[name][1])}"
                     for name in delegated
                 )
         return "\n".join(lines)
@@ -484,6 +523,29 @@ class McpToolCollection:
             connection.close()
         self._connections.clear()
         self._tools.clear()
+        self._delegated_tools.clear()
+
+
+def parse_tool_descriptors(raw_tools: list[Any], server_name: str) -> list[McpTool]:
+    """Parse tool descriptors carried by a portable metadata extension."""
+    parsed: list[McpTool] = []
+    for raw_tool in raw_tools:
+        if not isinstance(raw_tool, dict):
+            raise McpError(f"MCP server {server_name!r} returned an invalid delegated tool")
+        name = raw_tool.get("name")
+        description = raw_tool.get("description", "")
+        schema = raw_tool.get("inputSchema")
+        raw_meta = raw_tool.get("_meta", {})
+        metadata = raw_meta.get("terminal-agent/tool", {}) if isinstance(raw_meta, dict) else {}
+        if (
+            not isinstance(name, str)
+            or not isinstance(description, str)
+            or not isinstance(schema, dict)
+            or not isinstance(metadata, dict)
+        ):
+            raise McpError(f"MCP server {server_name!r} returned an invalid delegated tool")
+        parsed.append(McpTool(name, description, schema, metadata))
+    return parsed
 
 
 def normalize_content_result(response: dict[str, Any]) -> dict[str, Any]:

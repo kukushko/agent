@@ -119,6 +119,14 @@ class McpTransportIntegrationTest(unittest.TestCase):
             try:
                 collection.add(connection, prefix=False)
                 self.assertGreaterEqual(collection.tool_count, 6)
+                direct_names = {
+                    item["function"]["name"] for item in collection.api_definitions()
+                }
+                self.assertNotIn("llm.ask", direct_names)
+                self.assertIn(
+                    "llm.ask",
+                    {tool.name for tool in collection.tool_descriptors()},
+                )
                 written = collection.execute(
                     "files.write", {"path": "result.txt", "content": "hello"}
                 )
@@ -165,6 +173,9 @@ class McpTransportIntegrationTest(unittest.TestCase):
                     self.assertIn(
                         "tools.files.read(path: string)",
                         collection.prompt_instructions(),
+                    )
+                    self.assertIn(
+                        "tools.llm.ask(", collection.prompt_instructions()
                     )
                     self.assertIn(
                         ".content.splitlines()", collection.prompt_instructions()

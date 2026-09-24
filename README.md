@@ -61,6 +61,10 @@ Agent-wide settings can be overridden with command-line arguments or their
 | tool-call limit | `--max-tool-calls` | `AGENT_MAX_TOOL_CALLS` |
 | history limit | `--history-limit` | `AGENT_HISTORY_LIMIT` |
 
+The agent's model endpoint and the MCP delegated-model endpoint are contacted
+directly. Generic process-wide HTTP proxy variables do not reroute these model
+requests; the web package owns its separate fixed proxy configuration.
+
 The embedded MCP server is enabled by default. `--disable-embedded-mcp` runs the
 agent without bundled tools, and repeatable `--add-mcp NAME=URL` arguments add
 external Streamable HTTP MCP servers.
@@ -152,6 +156,10 @@ Available tools:
 - `web.search` - search the public web through a configured provider
 - `web.fetch_as_markdown` - download public pages through a fixed proxy into `work/offline`
 - `jobs.run` - run persistent sandboxed Python that orchestrates other tools
+
+`llm.ask` is intentionally absent from the direct tool list. It is advertised
+only in the delegated catalog used to write `jobs.run` programs; see
+[Delegated LLM Calls](#delegated-llm-calls).
 
 The default work directory is `./work` from the current working directory. Use
 `--work-dir some/path` or `AGENT_WORK_DIR=some/path` to change it.
@@ -262,7 +270,7 @@ and a typed dictionary return value. Default parameter values distinguish
 optional parameters from required ones.
 
 ```python
-from tools import Delegation, ToolPackage, tool
+from tools import Delegation, ToolExposure, ToolPackage, tool
 
 
 class ExampleTools(ToolPackage):
@@ -288,8 +296,8 @@ TOOL_PACKAGES = (ExampleTools,)
 
 The runtime registers this method as `example.search`, validates its signature,
 and generates its prompt schema from the type hints, defaults, and docstring.
-The decorator also owns portable metadata such as whether delegated execution
-may call the tool, its named resource costs, optional prompt instructions, and
+The decorator also owns portable metadata such as whether direct and delegated
+surfaces expose the tool, its named resource costs, optional prompt instructions, and
 epistemic roles and role-specific reliability guidance. Roles describe generic ways a tool can improve reliability,
 such as `lookup`, `verification`, `computation`, `workspace`, or
 `orchestration`. The MCP client uses the active catalog to generate a soft
@@ -363,6 +371,12 @@ supported. The current HTTP client does not yet implement OAuth discovery or
 interactive authorization, so authenticated remote servers must currently be
 placed behind an already authorized endpoint.
 
+The bundled MCP extension transports delegated-only declarations separately
+from directly callable tools. The agent can therefore document their
+`tools.package.method(...)` signatures inside job instructions without making
+them available as ordinary top-level calls. Servers without this metadata keep
+the conservative compatible behavior.
+
 The embedded connection receives a private `_meta` value containing only the
 current bounded conversation history needed by `files.write_history`. This
 metadata is never sent to external MCP servers.
@@ -391,6 +405,13 @@ python3.12 agent.py \
 
 The HTTP server has no built-in authentication and should not be exposed to an
 untrusted network. Its default listen address is `127.0.0.1:9000`.
+
+The server-side language-model service uses `--llm-base-url`, `--llm-model`,
+and `--llm-timeout`. Their environment equivalents are `MCP_LLM_BASE_URL`,
+`MCP_LLM_MODEL`, and `MCP_LLM_TIMEOUT`; the API key is accepted only through
+`MCP_LLM_API_KEY`. An embedded server receives the agent's endpoint, model,
+timeout, and key through its child-process environment, never through its
+command line.
 
 ## Python Jobs
 
@@ -442,6 +463,9 @@ host-side broker:
 | total brokered calls | 200 |
 | file reads | 100 |
 | web searches | 10 |
+| delegated LLM calls | 2 |
+| delegated LLM input tokens | 131072 |
+| delegated LLM output tokens | 8192 |
 | result size | 1 MiB |
 | stdout | 1 MiB |
 | stderr | 1 MiB |
@@ -486,11 +510,54 @@ calls.jsonl            broker call journal
 artifacts/             private intermediate files
 requests/              pending, processing, and completed requests
 responses/             broker responses
+llm/                    delegated LLM request/response artifacts
 ```
 
 Every job receives its own directory and Docker mount. Requests and responses
 are published with atomic renames. The host validates IPC directories and opens
 container-controlled JSON files without following symlinks.
+
+### Delegated LLM Calls
+
+`llm.ask` lets a job apply semantic interpretation to compact intermediate
+data without returning that data to the main conversation. It is stateless,
+receives no chat history, exposes no tools to its nested model call, and cannot
+recursively run a job. The caller supplies a precise instruction, a JSON object,
+and a JSON Schema:
+
+```python
+matches = tools.files.semantic_search(query="payment failure", path="offline").matches
+answer = tools.llm.ask(
+    instruction="Classify each excerpt as relevant or irrelevant.",
+    data={"matches": matches},
+    response_schema={
+        "type": "object",
+        "properties": {
+            "relevant_indexes": {
+                "type": "array",
+                "items": {"type": "integer"},
+            }
+        },
+        "required": ["relevant_indexes"],
+        "additionalProperties": False,
+    },
+)
+result = answer.value
+```
+
+The service validates the schema before calling the model, requests structured
+JSON, validates the returned value, and makes at most one repair attempt. The
+package defaults limit one response to 4096 output tokens and the serialized
+instruction/data/schema to 131072 characters; callers may request a smaller
+`max_output_tokens`. Override these MCP-owned limits with
+`--tool-param llm:max_output_tokens=...` and
+`--tool-param llm:max_input_chars=...`.
+
+Actual input and output tokens are reported as generic job resources and count
+against the job quotas. Each call is also persisted under
+`tmp/jobs/<job-id>/llm/` with its input, schema, validated value, raw provider
+response, duration, attempt count, and usage. These files may contain sensitive
+task data and are excluded from Git with the rest of `tmp/`.
 
 ## Web Access
 
@@ -656,6 +723,7 @@ toolconfig.py            shared package-parameter parser
 toolpolicy.py            generic rendering of tool-owned reliability guidance
 tools/                   server-side tool packages and registry
 semanticsearch/          lazy ONNX embeddings and mirrored incremental indexes
+llmservice/              bounded OpenAI-compatible structured-output client
 websearch/               provider-neutral search types and provider adapters
 webfetch/                proxy-only page transport, extraction, and offline storage
 sandbox/                 sandbox interface and Docker implementation
@@ -664,6 +732,7 @@ workpaths.py             shared work-directory path validation
 test_agent_tools.py      agent, registry, file, and web tool tests
 test_webfetch.py         web transport, conversion, and offline storage tests
 test_jobs.py             job policy, quota, and IPC safety tests
+test_llm_tools.py        delegated exposure, artifacts, and usage tests
 test_semantic_search.py  semantic chunking, indexing, availability, and reuse tests
 test_mcp.py              MCP protocol and transport integration tests
 test_sandbox_tools.py    sandbox and Python tool tests

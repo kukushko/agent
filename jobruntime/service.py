@@ -16,7 +16,7 @@ from typing import Any, BinaryIO, Protocol
 
 from mcpbridge.client import McpToolCollection
 from sandbox import DockerSandbox, SandboxError
-from tools.base import Delegation
+from tools.base import Delegation, ToolContext, activate_tool_context
 from tools.runtime import ToolRegistry
 
 
@@ -94,7 +94,7 @@ class JobService:
         self.local_registry = local_registry
         self.external_tools = external_tools
         tools: dict[str, JobTool] = {}
-        for definition in local_registry.definitions():
+        for definition in local_registry.definitions("delegated"):
             delegation = definition.metadata.delegation
             if delegation.allowed:
                 tools[definition.name] = JobTool(
@@ -105,7 +105,7 @@ class JobService:
                 )
         for tool in external_tools.tool_descriptors():
             delegation = delegation_from_metadata(tool.metadata)
-            if delegation.allowed:
+            if delegation.allowed and delegated_exposure_from_metadata(tool.metadata):
                 if tool.name in tools:
                     raise ValueError(f"duplicate job tool name: {tool.name}")
                 tools[tool.name] = JobTool(
@@ -330,7 +330,8 @@ class JobService:
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
             self._charge(name, usage)
-            result = self._execute_tool(name, arguments)
+            result = self._execute_tool(name, arguments, path.parents[2])
+            self._charge_usage(result.resource_usage, usage)
             return {
                 "id": request_id,
                 "tool": name,
@@ -356,10 +357,37 @@ class JobService:
         for resource, amount in costs.items():
             usage.resources[resource] = usage.resources.get(resource, 0) + amount
 
-    def _execute_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    def _charge_usage(self, measured: dict[str, int], usage: JobUsage) -> None:
+        if any(
+            not isinstance(resource, str)
+            or not resource
+            or not isinstance(amount, int)
+            or isinstance(amount, bool)
+            or amount < 0
+            for resource, amount in measured.items()
+        ):
+            raise ValueError("measured resource usage must contain non-negative integers")
+        exceeded: str | None = None
+        for resource, amount in measured.items():
+            limit = self.policy.quotas.get(resource)
+            used = usage.resources.get(resource, 0)
+            if limit is not None and used + amount > limit:
+                exceeded = exceeded or resource
+        for resource, amount in measured.items():
+            usage.resources[resource] = usage.resources.get(resource, 0) + amount
+        if exceeded is not None:
+            raise RuntimeError(f"job resource budget is exhausted: {exceeded}")
+
+    def _execute_tool(self, name: str, arguments: dict[str, Any], job_dir: Path) -> Any:
         assert self.local_registry is not None and self.external_tools is not None
-        if any(definition.name == name for definition in self.local_registry.definitions()):
-            return self.local_registry.execute(name, arguments)
+        if self.local_registry.is_exposed(name, "delegated"):
+            context = ToolContext(
+                user_input="",
+                history=(),
+                state={"job_dir": job_dir, "execution_surface": "delegated"},
+            )
+            with activate_tool_context(context):
+                return self.local_registry.execute(name, arguments)
         return self.external_tools.execute(name, arguments)
 
 
@@ -407,6 +435,12 @@ def delegation_from_metadata(metadata: dict[str, Any] | None) -> Delegation:
         ),
         reason=reason if isinstance(reason, str) else None,
     )
+
+
+def delegated_exposure_from_metadata(metadata: dict[str, Any] | None) -> bool:
+    """Read portable exposure metadata with compatible external defaults."""
+    exposure = (metadata or {}).get("exposure", {})
+    return not isinstance(exposure, dict) or exposure.get("delegated", True) is True
 
 
 def create_job_id() -> str:
