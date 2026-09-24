@@ -11,7 +11,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from jsonschema import ValidationError, validators
 
-from tools.llm import LanguageModelResponse
+from tools.llm import LanguageModelFailure, LanguageModelResponse
 
 
 THINK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
@@ -50,6 +50,7 @@ class OpenAIJsonService:
         validator_class.check_schema(response_schema)
         validator = validator_class(response_schema)
         usage = {"llm_input_tokens": 0, "llm_output_tokens": 0}
+        raw_responses: list[dict[str, object]] = []
         messages = [
             {
                 "role": "system",
@@ -72,12 +73,20 @@ class OpenAIJsonService:
             },
         ]
         last_error = "invalid structured response"
-        raw_response: dict[str, object] = {}
         for attempt in range(2):
-            raw_response = self._complete(messages, response_schema, max_output_tokens)
-            add_usage(usage, raw_response.get("usage"))
-            content = response_content(raw_response)
             try:
+                raw_response = self._complete(
+                    messages, response_schema, max_output_tokens
+                )
+            except RuntimeError as exc:
+                raise model_failure(
+                    str(exc), started, usage, attempt + 1, raw_responses
+                ) from exc
+            raw_responses.append(raw_response)
+            add_usage(usage, raw_response.get("usage"))
+            content = ""
+            try:
+                content = response_content(raw_response)
                 value = parse_json_content(content)
                 validator.validate(value)
                 return LanguageModelResponse(
@@ -85,23 +94,31 @@ class OpenAIJsonService:
                     usage=usage,
                     duration_ms=int((time.monotonic() - started) * 1000),
                     attempts=attempt + 1,
-                    raw_response=raw_response,
+                    raw_responses=tuple(raw_responses),
                 )
-            except (ValueError, json.JSONDecodeError, ValidationError) as exc:
+            except (RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
                 last_error = str(exc)
-                messages.extend(
-                    (
-                        {"role": "assistant", "content": content},
+                if attempt == 0:
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
+                    messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "The response was invalid: " + last_error +
-                                ". Return one corrected JSON value only."
+                                "The previous attempt failed: " + last_error + ". "
+                                "Do not deliberate about unavailable facts. Express uncertainty "
+                                "inside the requested schema when necessary, and return the "
+                                "corrected JSON value immediately."
                             ),
-                        },
+                        }
                     )
-                )
-        raise RuntimeError(f"LLM did not return schema-valid JSON: {last_error}")
+        raise model_failure(
+            f"LLM did not return schema-valid JSON after one repair: {last_error}",
+            started,
+            usage,
+            2,
+            raw_responses,
+        )
 
     def _complete(
         self,
@@ -156,7 +173,14 @@ def response_content(response: dict[str, object]) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError("LLM response has no assistant content") from exc
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("LLM returned empty assistant content")
+        finish_reason = choices[0].get("finish_reason")  # type: ignore[index]
+        if finish_reason == "length":
+            raise RuntimeError(
+                "LLM exhausted its output budget during reasoning without producing JSON"
+            )
+        raise RuntimeError(
+            f"LLM returned empty assistant content (finish_reason={finish_reason!r})"
+        )
     return content
 
 
@@ -176,3 +200,19 @@ def add_usage(total: dict[str, int], raw: object) -> None:
         value = raw.get(source)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             total[target] += value
+
+
+def model_failure(
+    message: str,
+    started: float,
+    usage: dict[str, int],
+    attempts: int,
+    raw_responses: list[dict[str, object]],
+) -> LanguageModelFailure:
+    return LanguageModelFailure(
+        message,
+        usage=dict(usage),
+        duration_ms=int((time.monotonic() - started) * 1000),
+        attempts=attempts,
+        raw_responses=tuple(raw_responses),
+    )

@@ -546,17 +546,22 @@ result = answer.value
 ```
 
 The service validates the schema before calling the model, requests structured
-JSON, validates the returned value, and makes at most one repair attempt. The
+JSON, validates the returned value, and makes at most one repair attempt. An
+output-budget exhaustion with empty content is treated as a repairable failure,
+not as an unexplained empty response. The retry explicitly tells the model to
+express uncertainty in the requested schema when the supplied data does not
+contain a requested fact. The
 package defaults limit one response to 4096 output tokens and the serialized
 instruction/data/schema to 131072 characters; callers may request a smaller
 `max_output_tokens`. Override these MCP-owned limits with
 `--tool-param llm:max_output_tokens=...` and
 `--tool-param llm:max_input_chars=...`.
 
-Actual input and output tokens are reported as generic job resources and count
-against the job quotas. Each call is also persisted under
+Actual input and output tokens from every attempt, including failed and repaired
+attempts, are reported as generic job resources and count against the job
+quotas. Each successful or failed call is also persisted under
 `tmp/jobs/<job-id>/llm/` with its input, schema, validated value, raw provider
-response, duration, attempt count, and usage. These files may contain sensitive
+responses, error, duration, attempt count, and usage. These files may contain sensitive
 task data and are excluded from Git with the rest of `tmp/`.
 
 ## Web Access
